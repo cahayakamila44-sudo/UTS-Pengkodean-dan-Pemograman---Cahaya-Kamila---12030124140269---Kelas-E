@@ -1,0 +1,637 @@
+-- =====================================================================
+-- SOAL 3.2 : Audit Trail & Immutability
+-- PostgreSQL / Supabase RPC
+-- Dijalankan SETELAH DDL Soal 1
+-- =====================================================================
+
+
+-- ============================================================
+-- 0) Extension untuk SHA-256
+-- ============================================================
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+
+-- ============================================================
+-- 1) Kolom audit pada journal_headers
+-- ============================================================
+
+ALTER TABLE journal_headers
+ADD COLUMN created_by UUID NOT NULL DEFAULT auth.uid(),
+ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ADD COLUMN posted_at TIMESTAMPTZ,
+ADD COLUMN hash_checksum CHAR(64),
+ADD COLUMN reversal_of BIGINT
+    REFERENCES journal_headers(id)
+    ON DELETE RESTRICT;
+
+
+-- Satu jurnal hanya dapat dibalik satu kali
+CREATE UNIQUE INDEX uq_journal_reversal_of
+ON journal_headers(reversal_of)
+WHERE reversal_of IS NOT NULL;
+
+
+-- ============================================================
+-- 2) Tabel audit_log
+-- ============================================================
+
+CREATE TABLE audit_log (
+    id           BIGSERIAL PRIMARY KEY,
+    table_name   TEXT NOT NULL,
+    record_id    BIGINT NOT NULL,
+    action       TEXT NOT NULL
+                 CHECK (action IN ('INSERT', 'UPDATE', 'DELETE')),
+    old_data     JSONB,
+    new_data     JSONB,
+    performed_by UUID DEFAULT auth.uid(),
+    performed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+
+-- ============================================================
+-- 3) Fungsi menghitung hash SHA-256 jurnal
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION fn_compute_journal_hash(
+    p_header_id BIGINT
+)
+RETURNS TEXT
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT encode(
+        digest(
+            convert_to(
+                concat_ws(
+                    '|',
+                    h.id::text,
+                    to_char(h.trx_date, 'YYYY-MM-DD'),
+                    h.ref_no,
+                    h.description,
+                    h.created_by::text,
+                    to_char(
+                        h.created_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD"T"HH24:MI:SS.US'
+                    ),
+                    COALESCE(h.reversal_of::text, ''),
+                    COALESCE(
+                        (
+                            SELECT string_agg(
+                                l.account_id::text
+                                || ':' ||
+                                l.debit::text
+                                || ':' ||
+                                l.credit::text,
+                                ';'
+                                ORDER BY l.id
+                            )
+                            FROM journal_lines l
+                            WHERE l.header_id = h.id
+                        ),
+                        ''
+                    )
+                ),
+                'UTF8'
+            ),
+            'sha256'
+        ),
+        'hex'
+    )
+    FROM journal_headers h
+    WHERE h.id = p_header_id;
+$$;
+
+
+-- ============================================================
+-- 4) Fungsi verifikasi hash satu jurnal
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION fn_verify_journal_hash(
+    p_header_id BIGINT
+)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT
+        h.hash_checksum = fn_compute_journal_hash(h.id)
+    FROM journal_headers h
+    WHERE h.id = p_header_id
+      AND h.posting_status = 'POSTED';
+$$;
+
+
+-- ============================================================
+-- 5) Penjaga immutability journal_headers
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION trg_journal_header_guard()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_debit  NUMERIC(18,2);
+    v_credit NUMERIC(18,2);
+BEGIN
+
+    -- INSERT
+    IF TG_OP = 'INSERT' THEN
+
+        IF NEW.posting_status <> 'DRAFT' THEN
+            RAISE EXCEPTION
+                'Jurnal baru harus berstatus DRAFT; gunakan proses posting';
+        END IF;
+
+        IF auth.uid() IS NULL THEN
+            RAISE EXCEPTION
+                'Pengguna harus terautentikasi';
+        END IF;
+
+        -- Identitas dan waktu dibuat oleh database
+        NEW.created_by := auth.uid();
+        NEW.created_at := now();
+
+        RETURN NEW;
+    END IF;
+
+
+    -- DELETE
+    IF TG_OP = 'DELETE' THEN
+
+        IF OLD.posting_status = 'POSTED' THEN
+            RAISE EXCEPTION
+                'Jurnal POSTED (%) tidak boleh dihapus; gunakan jurnal pembalik',
+                OLD.ref_no
+                USING ERRCODE = 'integrity_constraint_violation';
+        END IF;
+
+        RETURN OLD;
+    END IF;
+
+
+    -- UPDATE
+    IF TG_OP = 'UPDATE' THEN
+
+        -- Jurnal POSTED tidak boleh diubah
+        IF OLD.posting_status = 'POSTED' THEN
+            RAISE EXCEPTION
+                'Jurnal POSTED (%) tidak boleh diubah; gunakan jurnal pembalik (storno)',
+                OLD.ref_no
+                USING ERRCODE = 'integrity_constraint_violation';
+        END IF;
+
+
+        -- created_by dan created_at tidak boleh diubah
+        IF NEW.created_by IS DISTINCT FROM OLD.created_by
+           OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+
+            RAISE EXCEPTION
+                'created_by / created_at tidak boleh diubah';
+
+        END IF;
+
+
+        -- Transisi DRAFT -> POSTED
+        IF OLD.posting_status = 'DRAFT'
+           AND NEW.posting_status = 'POSTED' THEN
+
+            SELECT
+                COALESCE(SUM(debit), 0),
+                COALESCE(SUM(credit), 0)
+            INTO v_debit, v_credit
+            FROM journal_lines
+            WHERE header_id = OLD.id;
+
+
+            -- Validasi double-entry
+            IF v_debit <> v_credit OR v_debit = 0 THEN
+                RAISE EXCEPTION
+                    'Posting ditolak: debit=% kredit=%',
+                    v_debit, v_credit;
+            END IF;
+
+
+            -- Waktu posting
+            NEW.posted_at := now();
+
+
+            -- Hash dibuat dari data jurnal yang akan dikunci
+            NEW.hash_checksum := encode(
+                digest(
+                    convert_to(
+                        concat_ws(
+                            '|',
+                            NEW.id::text,
+                            to_char(
+                                NEW.trx_date,
+                                'YYYY-MM-DD'
+                            ),
+                            NEW.ref_no,
+                            NEW.description,
+                            NEW.created_by::text,
+                            to_char(
+                                NEW.created_at AT TIME ZONE 'UTC',
+                                'YYYY-MM-DD"T"HH24:MI:SS.US'
+                            ),
+                            COALESCE(
+                                NEW.reversal_of::text,
+                                ''
+                            ),
+                            COALESCE(
+                                (
+                                    SELECT string_agg(
+                                        l.account_id::text
+                                        || ':' ||
+                                        l.debit::text
+                                        || ':' ||
+                                        l.credit::text,
+                                        ';'
+                                        ORDER BY l.id
+                                    )
+                                    FROM journal_lines l
+                                    WHERE l.header_id = NEW.id
+                                ),
+                                ''
+                            )
+                        ),
+                        'UTF8'
+                    ),
+                    'sha256'
+                ),
+                'hex'
+            );
+
+        END IF;
+
+        RETURN NEW;
+
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+
+CREATE TRIGGER trg_journal_header_guard
+BEFORE INSERT OR UPDATE OR DELETE
+ON journal_headers
+FOR EACH ROW
+EXECUTE FUNCTION trg_journal_header_guard();
+
+
+-- ============================================================
+-- 6) Penjaga immutability journal_lines
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION trg_journal_line_guard()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_status VARCHAR(10);
+    v_hdr BIGINT;
+BEGIN
+
+    IF TG_OP = 'DELETE' THEN
+        v_hdr := OLD.header_id;
+    ELSE
+        v_hdr := NEW.header_id;
+    END IF;
+
+
+    SELECT posting_status
+    INTO v_status
+    FROM journal_headers
+    WHERE id = v_hdr;
+
+
+    -- Baris jurnal POSTED tidak boleh diubah/dihapus
+    IF v_status = 'POSTED' THEN
+        RAISE EXCEPTION
+            'Baris jurnal milik jurnal POSTED tidak boleh di-%; gunakan jurnal pembalik',
+            TG_OP
+            USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+
+
+    -- Header tidak boleh dipindahkan
+    IF TG_OP = 'UPDATE'
+       AND NEW.header_id <> OLD.header_id THEN
+
+        RAISE EXCEPTION
+            'header_id baris jurnal tidak boleh dipindah';
+
+    END IF;
+
+
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    ELSE
+        RETURN NEW;
+    END IF;
+
+END;
+$$;
+
+
+CREATE TRIGGER trg_journal_line_guard
+BEFORE INSERT OR UPDATE OR DELETE
+ON journal_lines
+FOR EACH ROW
+EXECUTE FUNCTION trg_journal_line_guard();
+
+
+-- ============================================================
+-- 7) Audit log otomatis
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION trg_write_audit_log()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_record_id BIGINT;
+BEGIN
+
+    IF TG_OP = 'DELETE' THEN
+        v_record_id := OLD.id;
+    ELSE
+        v_record_id := NEW.id;
+    END IF;
+
+
+    INSERT INTO audit_log (
+        table_name,
+        record_id,
+        action,
+        old_data,
+        new_data,
+        performed_by
+    )
+    VALUES (
+        TG_TABLE_NAME,
+        v_record_id,
+        TG_OP,
+        CASE
+            WHEN TG_OP IN ('UPDATE', 'DELETE')
+            THEN to_jsonb(OLD)
+        END,
+        CASE
+            WHEN TG_OP IN ('INSERT', 'UPDATE')
+            THEN to_jsonb(NEW)
+        END,
+        auth.uid()
+    );
+
+
+    RETURN NULL;
+END;
+$$;
+
+
+CREATE TRIGGER trg_audit_headers
+AFTER INSERT OR UPDATE OR DELETE
+ON journal_headers
+FOR EACH ROW
+EXECUTE FUNCTION trg_write_audit_log();
+
+
+CREATE TRIGGER trg_audit_lines
+AFTER INSERT OR UPDATE OR DELETE
+ON journal_lines
+FOR EACH ROW
+EXECUTE FUNCTION trg_write_audit_log();
+
+
+-- ============================================================
+-- 8) Audit log append-only
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION trg_block_modification()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+
+    RAISE EXCEPTION
+        '% pada % tidak diperbolehkan karena tabel bersifat append-only',
+        TG_OP,
+        TG_TABLE_NAME;
+
+END;
+$$;
+
+
+CREATE TRIGGER trg_audit_log_append_only
+BEFORE UPDATE OR DELETE
+ON audit_log
+FOR EACH ROW
+EXECUTE FUNCTION trg_block_modification();
+
+
+CREATE TRIGGER trg_no_truncate_audit
+BEFORE TRUNCATE
+ON audit_log
+FOR EACH STATEMENT
+EXECUTE FUNCTION trg_block_modification();
+
+
+CREATE TRIGGER trg_no_truncate_headers
+BEFORE TRUNCATE
+ON journal_headers
+FOR EACH STATEMENT
+EXECUTE FUNCTION trg_block_modification();
+
+
+CREATE TRIGGER trg_no_truncate_lines
+BEFORE TRUNCATE
+ON journal_lines
+FOR EACH STATEMENT
+EXECUTE FUNCTION trg_block_modification();
+
+
+-- ============================================================
+-- 9) RPC membuat dan mem-posting jurnal dalam satu transaksi
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION rpc_create_posted_journal(
+    p_ref_no TEXT,
+    p_trx_date DATE,
+    p_description TEXT,
+    p_lines JSONB
+)
+RETURNS BIGINT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_id BIGINT;
+BEGIN
+
+    -- Membuat header sebagai DRAFT
+    INSERT INTO journal_headers (
+        trx_date,
+        ref_no,
+        description
+    )
+    VALUES (
+        p_trx_date,
+        p_ref_no,
+        p_description
+    )
+    RETURNING id INTO v_id;
+
+
+    -- Membuat baris jurnal
+    INSERT INTO journal_lines (
+        header_id,
+        account_id,
+        debit,
+        credit
+    )
+    SELECT
+        v_id,
+        x.account_id,
+        COALESCE(x.debit, 0),
+        COALESCE(x.credit, 0)
+    FROM jsonb_to_recordset(p_lines)
+    AS x(
+        account_id BIGINT,
+        debit NUMERIC,
+        credit NUMERIC
+    );
+
+
+    -- Posting jurnal
+    -- Validasi balance dan hash dilakukan oleh trigger
+    UPDATE journal_headers
+    SET posting_status = 'POSTED'
+    WHERE id = v_id;
+
+
+    RETURN v_id;
+
+END;
+$$;
+
+
+-- ============================================================
+-- 10) RPC jurnal pembalik / reversing entry / storno
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION rpc_reverse_journal(
+    p_header_id BIGINT,
+    p_reason TEXT
+)
+RETURNS BIGINT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_orig journal_headers%ROWTYPE;
+    v_new  BIGINT;
+BEGIN
+
+    -- Mengunci jurnal asli untuk mencegah concurrent reversal
+    SELECT *
+    INTO v_orig
+    FROM journal_headers
+    WHERE id = p_header_id
+    FOR UPDATE;
+
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Jurnal % tidak ditemukan',
+            p_header_id;
+    END IF;
+
+
+    IF v_orig.posting_status <> 'POSTED' THEN
+        RAISE EXCEPTION
+            'Hanya jurnal POSTED yang dapat dibalik';
+    END IF;
+
+
+    -- Mencegah jurnal yang sama dibalik lebih dari satu kali
+    IF EXISTS (
+        SELECT 1
+        FROM journal_headers
+        WHERE reversal_of = p_header_id
+    ) THEN
+
+        RAISE EXCEPTION
+            'Jurnal % sudah pernah dibalik',
+            p_header_id;
+
+    END IF;
+
+
+    -- Membuat header jurnal pembalik
+    INSERT INTO journal_headers (
+        trx_date,
+        ref_no,
+        description,
+        reversal_of
+    )
+    VALUES (
+        current_date,
+        v_orig.ref_no || '-REV',
+        'Pembalik ' || v_orig.ref_no || ': ' || p_reason,
+        p_header_id
+    )
+    RETURNING id INTO v_new;
+
+
+    -- Menukar debit dan kredit
+    INSERT INTO journal_lines (
+        header_id,
+        account_id,
+        debit,
+        credit
+    )
+    SELECT
+        v_new,
+        account_id,
+        credit,
+        debit
+    FROM journal_lines
+    WHERE header_id = p_header_id
+    ORDER BY id;
+
+
+    -- Posting jurnal pembalik
+    UPDATE journal_headers
+    SET posting_status = 'POSTED'
+    WHERE id = v_new;
+
+
+    RETURN v_new;
+
+END;
+$$;
+
+
+-- ============================================================
+-- 11) RPC verifikasi hash seluruh jurnal POSTED
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION rpc_verify_all_journals()
+RETURNS TABLE (
+    id BIGINT,
+    ref_no VARCHAR,
+    hash_valid BOOLEAN
+)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT
+        h.id,
+        h.ref_no,
+        (
+            h.hash_checksum =
+            fn_compute_journal_hash(h.id)
+        ) AS hash_valid
+    FROM journal_headers h
+    WHERE h.posting_status = 'POSTED'
+    ORDER BY h.id;
+$$;
